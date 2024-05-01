@@ -1,0 +1,255 @@
+version: "2"
+
+name: Random Read 32KB
+
+summary: |
+  Measures peak burst performance of random reads 32KB Block
+
+estimated_runtime: 20m
+
+variables:
+- name: runtime_secs
+  display_name: "Runtime (seconds)"
+  description: Defines the length of the measurement period for each workload.
+  integer:
+    default_value: 300
+    minimum_value: 1
+- name: additional_datastores
+  display_name: "Additional Datastores"
+  required: false
+  description: |
+    An optional list of additional datastores, containers, or shares to be used
+    to store virtual disks. The datastore chosen during target discovery will
+    also be used. Names should be separated by commas. Because there are six
+    virtual disks, defining one, two, or five additional datastores will evenly
+    balance the number of virtual disks. On Hyper-V, the full share path must
+    be provided, including the two leading backslash characters.
+  string:
+    default_value: ""
+- name: data_compression
+  display_name: "Data Compressibility (buffer_compress_percentage)" 
+  description: |
+    Specify the compressibility of the data being tested in the benchmark. 
+    The 'buffer_compress_percentage' parameter controls the level of data 
+    compression applied during WRITE operations
+  integer:
+    default_value: 75
+    minimum_value: 0
+    maximum_value: 100
+- name: _warmup_secs
+  display_name: "Warm Up (seconds)"
+  description: Defines the length of the warm up period for each workload.
+  integer:
+    default_value: 60
+    minimum_value: 1
+- name: _cooldown_secs
+  display_name: "Cool Down (seconds)"
+  description: Defines the length of the cool down period for each workload.
+  integer:
+    default_value: 20
+    minimum_value: 5
+- name: _break_period_secs
+  display_name: "Break period (seconds)"
+  description: Defines the length of the break between workloads.
+  integer:
+    default_value: 5
+    minimum_value: 5
+- name: _number_of_vdisks
+  display_name: "Number of Virtual Disks"
+  description: Defines the number of virtual disks per VM.
+  integer:
+    default_value: 6
+    minimum_value: 6
+    maximum_value: 6
+- name: _vdisk_size_gib
+  display_name: "Virtual Disk Size (GiB)"
+  description: Defines the size of each virtual disk in gibibytes.
+  integer:
+    default_value: 40
+    minimum_value: 16
+    maximum_value: 80
+
+# Reject filter used to discard any empty strings.
+{% set list_of_additional_datastores = additional_datastores.split(',')|reject('eq', '')|list %}
+{% set total_number_of_datastores = (list_of_additional_datastores|length) + 1 %}
+# Number of virtual disks guaranteed to be placed in each container.
+{% set min_vdisks_per_datastore = _number_of_vdisks // total_number_of_datastores %}
+# Number of virtual disks which can not be spread evenly across containers.
+{% set number_of_uneven_vdisks = _number_of_vdisks % total_number_of_datastores %}
+{%- set scalar_results_group_name = "Power Metrics" %}
+
+vm_groups:
+- name: group_0
+  template: default
+  vcpu_count: 4
+  ram: 16g
+  count_per_node: 2
+
+workloads:
+- name: Random Read Warmup
+  fio:
+    vm_group: group_0
+    jobfiles:
+    - random_read.fio
+- name: Random Read
+  fio:
+    vm_group: group_0
+    jobfiles:
+    - random_read.fio
+- name: Sequential Write
+  fio:
+    vm_group: group_0
+    jobfiles:
+    - sequential_write.fio
+    template_variables:
+      compression: {{ data_compression }}
+
+results:
+- name: Random Read IOPS
+  vm_group:
+    vm_group: group_0
+    metric: iops
+    aggregation: sum
+    phases:
+    - Random Read
+- name: Sequential Write I/O Throughput
+  vm_group:
+    vm_group: group_0
+    metric: bytes_per_second
+    aggregation: sum
+    phases:
+    - Sequential Write
+- name: Total Test Runtime(mins)
+  scalar:
+    type: total_power_time
+    group: {{ scalar_results_group_name }}
+    phases:
+    - Random Read
+- name: Total Energy Usage(kWh)
+  scalar:
+    type: total_energy_used
+    group: {{ scalar_results_group_name }}
+    phases:
+    - Random Read
+- name: Cluster CPU Usage
+  hypervisor:
+    metric: CpuUsage.Avg.Megahertz
+    aggregation: sum
+    phases:
+    - Random Read
+- name: Cluster Power Usage
+  hypervisor:
+    metric: PowerConsumed.Avg.Watts
+    aggregation: sum
+    phases:
+    - Random Read
+
+phases:
+- name: Setup
+  steps:
+  - name: cluster.CleanUp
+  - name: vm_group.CloneFromTemplate
+    args:
+      vm_group_name: group_0
+  # Add disks to the default container.
+  - name: vm_group.AddDisks
+    args:
+      vm_group: group_0
+      {% if number_of_uneven_vdisks %}
+      count: {{ min_vdisks_per_datastore + 1 }}
+      {% else %}
+      count: {{ min_vdisks_per_datastore }}
+      {% endif %}
+      size: {{ _vdisk_size_gib }}
+  # Add disks to each additional container, if specified.
+  {% for datastore in list_of_additional_datastores[:(_number_of_vdisks - 1)] if datastore %}
+  - name: vm_group.AddDisks
+    args:
+      vm_group: group_0
+      # Note: loop.index starts at 1.
+      {% if loop.index < number_of_uneven_vdisks %}
+      count: {{ min_vdisks_per_datastore + 1 }}
+      {% else %}
+      count: {{ min_vdisks_per_datastore }}
+      {% endif %}
+      size: {{ _vdisk_size_gib }}
+      {% if datastore %}
+      container: {{ datastore }}
+      {% endif %}
+  {% endfor %}
+  - name: vm_group.PowerOn
+    args:
+      vm_group_name: group_0
+  - name: workload.PrefillRun
+    args:
+      workload_name: Sequential Write
+  - name: workload.Start
+    args:
+      workload_name: Random Read Warmup
+      runtime_secs: 600
+
+- name: Random Read Warm Up
+  steps:
+  - name: workload.Start
+    args:
+      workload_name: Random Read
+      runtime_secs: {{ _warmup_secs + runtime_secs + _cooldown_secs }}
+      async: True
+  - name: test.Wait
+    args:
+      duration_secs: {{ _warmup_secs }}
+- name: Random Read
+  steps:
+  - name: test.Annotate
+    args:
+      message: "Random Read: Started workload"
+  - name: test.Wait
+    args:
+      duration_secs: {{ runtime_secs }}
+  - name: test.Annotate
+    args:
+      message: "Random Read: Finished workload"
+- name: Random Read Cool Down
+  steps:
+  - name: workload.Wait
+    args:
+      workload_name: Random Read
+
+- name: Break 1
+  steps:
+  - name: test.Wait
+    args:
+      duration_secs: {{ _break_period_secs }}
+
+- name: Sequential Write Warm Up
+  steps:
+  - name: workload.Start
+    args:
+      workload_name: Sequential Write
+      runtime_secs: {{ _warmup_secs + runtime_secs + _cooldown_secs }}
+      async: True
+  - name: test.Wait
+    args:
+      duration_secs: {{ _warmup_secs }}
+- name: Sequential Write
+  steps:
+  - name: test.Annotate
+    args:
+      message: "Sequential Write: Started workload"
+  - name: test.Wait
+    args:
+      duration_secs: {{ runtime_secs }}
+  - name: test.Annotate
+    args:
+      message: "Sequential Write: Finished workload"
+- name: Sequential Write Cool Down
+  steps:
+  - name: workload.Wait
+    args:
+      workload_name: Sequential Write
+      annotate: True
+
+- name: Teardown
+  steps:
+  - name: test.CollectCurieVMLogs
+  - name: cluster.CleanUp
